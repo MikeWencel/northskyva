@@ -1,0 +1,265 @@
+name: 'Build'
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        php-versions: ['8.2', '8.3', '8.4']
+    name: PHP ${{ matrix.php-versions }}
+    env:
+      extensions: intl, pcov, mbstring
+      key: cache-v1
+      MYSQL_ROOT_PASSWORD: root
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # https://github.com/marketplace/actions/nerdbank-gitversioning
+    - name: Nerdbank.GitVersioning
+      uses: dotnet/nbgv@v0.4.2
+      with:
+          setAllVars: true
+
+    # Configure Caching
+    - name: Setup cache environment
+      id: cache-env
+      uses: shivammathur/cache-extensions@v1
+      with:
+        php-version: ${{ matrix.php-versions }}
+        extensions: ${{ env.extensions }}
+        key: ${{ env.key }}
+
+    - name: Cache extensions
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.cache-env.outputs.dir }}
+        key: ${{ steps.cache-env.outputs.key }}
+        restore-keys: ${{ steps.cache-env.outputs.key }}
+
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+
+    # Configure PHP
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-versions }}
+        extensions: ${{ env.extensions }}
+        ini-values: post_max_size=256M, short_open_tag=On
+        coverage: xdebug
+        tools: php-cs-fixer, phpunit
+
+    - name: Shutdown Ubuntu MySQL
+      run: sudo service mysql stop
+
+    - name: Install MySQL
+      uses: mirromutth/mysql-action@v1.1
+      with:
+        mysql version: '8.0'
+        mysql database: 'phpvms'
+        mysql root password: $MYSQL_ROOT_PASSWORD
+        mysql user: ''
+        mysql password: ''
+
+    - name: Wait for MySQL
+      run: |
+        while ! mysqladmin ping -h127.0.0.1 --silent; do
+          sleep 1
+        done
+
+    - name: Configure Environment
+      run: |
+        php --version
+        mysql --version
+        composer install --dev --no-interaction --verbose
+        composer dump-autoload
+        cp .github/scripts/env.test .env
+        cp .github/scripts/phpunit.xml phpunit.xml
+        .github/scripts/version.sh
+        php artisan database:create --reset
+        php artisan migrate:refresh --seed
+
+    - name: Get version
+      run: .github/scripts/version.sh
+
+    - name: Run Tests
+      run: |
+        export PHP_CS_FIXER_IGNORE_ENV=1
+        vendor/bin/pest --parallel --ci
+
+    - name: Run Rector
+      run: |
+        vendor/bin/rector --dry-run
+
+  # This runs after all of the tests, run have run. Creates a cleaned up version of the
+  # distro, and then creates the artifact to push up to S3 or wherever
+  artifacts:
+    name: 'Create release package'
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.repository == 'phpvms/phpvms' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # https://github.com/marketplace/actions/nerdbank-gitversioning
+    - name: Nerdbank.GitVersioning
+      uses: dotnet/nbgv@v0.4.2
+      with:
+          setAllVars: true
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+
+    - uses: olegtarasov/get-tag@v2.1.2
+      id: tagName
+
+    # Configure Caching
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+        restore-keys: ${{ runner.os }}-composer-
+
+      # Dependencies
+    - name: 'Install Release Dependencies'
+      run: |
+        rm -rf vendor
+        composer install --no-dev --prefer-dist --no-interaction --verbose
+        composer dump-autoload
+        sudo chmod +x ./.github/scripts/*
+
+    - name: Install NPM dependencies
+      run: npm install
+
+    - name: Compile assets
+      run: npm run build
+
+    - id: version
+      name: Get version
+      run: .github/scripts/version.sh
+
+    - name: Build Distro
+      run: .github/scripts/build.sh
+
+    - uses: BetaHuhn/do-spaces-action@v2
+      id: spaces
+      with:
+        access_key: ${{ secrets.SPACE_ACCESS_KEY}}
+        secret_key: ${{ secrets.SPACE_SECRET_KEY }}
+        space_name: ${{ secrets.SPACE_NAME }}
+        space_region: ${{ secrets.SPACE_REGION }}
+        source: dist
+        cdn_domain: phpvms.cdn.vmslabs.net
+        permission: public-read
+
+    - name: Discord notification
+      uses: Ilshidur/action-discord@0.3.2
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.V8_DISCORD_WEBHOOK }}
+      with:
+        args: ${{ steps.version.outputs.discord_msg }}
+
+    - name: Upload artifact for deployment job
+      uses: actions/upload-artifact@v4
+      with:
+        name: phpvms-package
+        path: 'dist/*'
+
+  docker:
+    name: 'Create docker image'
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.repository == 'phpvms/phpvms' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/dev')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # https://github.com/marketplace/actions/nerdbank-gitversioning
+      - name: Nerdbank.GitVersioning
+        uses: dotnet/nbgv@v0.4.2
+        with:
+            setAllVars: true
+
+      - id: version
+        name: Get version
+        run: .github/scripts/version.sh
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=edge,branch=dev
+            type=ref,event=branch
+#           type=sha,enable=false
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
